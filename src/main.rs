@@ -63,7 +63,7 @@ async fn compute(id: u16) -> Result<(), DataFusionError> {
     // create local session context
     let ctx = SessionContext::new();
 
-    let file_name = format!("part_account/{id}/pa_detail.parquet");
+    let file_name = format!("part_account_from_rds/{id}/pa_detail.parquet");
     ctx.runtime_env()
         .register_object_store(&s3_url, Arc::new(s3));
     let path = format!("s3://{bucket_name}/{file_name}");
