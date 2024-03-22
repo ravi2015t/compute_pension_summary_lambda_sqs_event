@@ -15,13 +15,7 @@ use datafusion::prelude::*;
 use object_store::aws::AmazonS3Builder;
 use tokio::time::Instant;
 
-/// This is the main body for the function.
-/// Write your code inside it.
-/// There are some code example in the following URLs:
-/// - https://github.com/awslabs/aws-lambda-rust-runtime/tree/main/examples
-/// - https://github.com/aws-samples/serverless-rust-demo/
 async fn function_handler(event: LambdaEvent<SqsEvent>) -> Result<(), Error> {
-    // Extract some useful information from the request
     let recs = event.payload.records;
     let bek_ids: Vec<u16> = recs
         .iter()
@@ -41,8 +35,6 @@ async fn function_handler(event: LambdaEvent<SqsEvent>) -> Result<(), Error> {
     for task in query_tasks {
         let _ = task.await.expect("waiting failed");
     }
-
-    let message = "Finished executing all tasks";
 
     Ok(())
 }
@@ -113,7 +105,6 @@ async fn compute(id: u16) -> Result<(), DataFusionError> {
                 filename = %filename,
                 "data successfully stored in S3",
             );
-            // Return `Response` (it will be serialized to JSON automatically by the runtime)
         }
         Err(err) => {
             // In case of failure, log a detailed error to CloudWatch.
@@ -126,7 +117,7 @@ async fn compute(id: u16) -> Result<(), DataFusionError> {
     }
 
     let end = Instant::now();
-    tracing::info!(
+    tracing::debug!(
         "Finished executing for task {} in time {:?}",
         id,
         end - start
