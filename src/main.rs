@@ -1,55 +1,85 @@
 use aws_lambda_events::event::sqs::SqsEvent;
+use aws_lambda_events::sqs::{BatchItemFailure, SqsBatchResponse};
 use lambda_runtime::{run, service_fn, tracing, Error, LambdaEvent};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::primitives::ByteStream;
 use datafusion::arrow::json;
+use datafusion::error::Result;
+use datafusion::prelude::*;
+use object_store::aws::AmazonS3Builder;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use url::Url;
-// use datafusion::dataframe::DataFrameWriteOptions;
-use datafusion::error::{DataFusionError, Result};
-use datafusion::prelude::*;
-// use env_logger::Env;
-use object_store::aws::AmazonS3Builder;
-use tokio::time::Instant;
 
-async fn function_handler(event: LambdaEvent<SqsEvent>) -> Result<(), Error> {
+async fn function_handler(event: LambdaEvent<SqsEvent>) -> Result<SqsBatchResponse, Error> {
     let recs = event.payload.records;
-    let bek_ids: Vec<u16> = recs
+    let mut batch_item_failures: Vec<BatchItemFailure> = vec![];
+
+    let (bek_ids, bek_id_map): (Vec<u16>, HashMap<u16, String>) = recs
         .iter()
-        .filter_map(|sqs_message| sqs_message.body.as_ref()) // Filter out None values
-        .filter_map(|body| {
+        .filter_map(|sqs_message| {
+            sqs_message
+                .body
+                .as_ref()
+                .map(|body| (sqs_message.message_id.clone(), body))
+        })
+        .filter_map(|(message_id, body)| {
             body.split(":")
                 .nth(1) // Extract the second part after splitting by ":"
                 .and_then(|bek_id_str| bek_id_str.trim().parse().ok()) // Parse to u16
+                .map(|bek_id: u16| (bek_id, message_id.clone()))
         })
-        .collect();
-
+        .fold(
+            (Vec::new(), HashMap::new()),
+            |(mut ids, mut map), (bek_id, message_id)| {
+                ids.push(bek_id);
+                map.insert(bek_id, message_id.unwrap());
+                (ids, map)
+            },
+        );
     let mut query_tasks = Vec::new();
     for i in bek_ids {
         query_tasks.push(tokio::spawn(compute(i)));
     }
-
+    // Await on all handles to ensure all tasks have completed
     for task in query_tasks {
-        let _ = task.await.expect("waiting failed");
+        if let Err((bek_id, _)) = task.await.unwrap() {
+            // If there was an error, retrieve the corresponding message ID and add it to failed_message_ids
+            if let Some(&ref message_id) = bek_id_map.get(&bek_id) {
+                batch_item_failures.push(BatchItemFailure {
+                    item_identifier: message_id.clone(),
+                });
+            }
+        }
     }
 
+    Ok(SqsBatchResponse {
+        batch_item_failures,
+    })
+}
+
+async fn compute(id: u16) -> Result<(), (u16, Error)> {
+    if let Err(err) = compute_pension_summary(id.into()).await {
+        tracing::error!(err=%err, "Failed to compute pension summary data.");
+        return Err((id, err));
+    }
+
+    if let Err(err) = transfer_to_s3(id.into()).await {
+        tracing::error!(err=%err, "Failed to compute pension summary data.");
+        return Err((id, err));
+    }
     Ok(())
 }
 
-async fn compute(id: u16) -> Result<(), DataFusionError> {
-    let start = Instant::now();
+async fn compute_pension_summary(id: i32) -> Result<(), Error> {
     let bucket_name = "pensioncalcseast1";
 
-    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let s3_client = aws_sdk_s3::Client::new(&config);
     let s3 = AmazonS3Builder::from_env()
         .with_bucket_name(bucket_name)
-        .build()
-        .expect("Failed to initialize s3");
-
+        .build()?;
     let s3_path = format!("s3://{bucket_name}");
     let s3_url = Url::parse(&s3_path).unwrap();
     // create local session context
@@ -85,43 +115,28 @@ async fn compute(id: u16) -> Result<(), DataFusionError> {
     for rec in recs {
         writer.write(&rec).expect("Write failed")
     }
-    writer.finish().unwrap();
+    writer.finish()?;
 
+    Ok(())
+}
+
+async fn transfer_to_s3(id: i32) -> Result<(), Error> {
+    let filename = format!("/tmp/result{}.json", id);
+    let bucket_name = "pensioncalcseast1";
+    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    let s3_client = aws_sdk_s3::Client::new(&config);
     let s3_key = format!("results/result{}.json", id);
 
     let body = ByteStream::from_path(Path::new(&filename)).await;
 
-    let response = s3_client
+    s3_client
         .put_object()
         .bucket(bucket_name)
         .body(body.unwrap())
         .key(&s3_key)
         .send()
-        .await;
+        .await?;
 
-    match response {
-        Ok(_) => {
-            tracing::info!(
-                filename = %filename,
-                "data successfully stored in S3",
-            );
-        }
-        Err(err) => {
-            // In case of failure, log a detailed error to CloudWatch.
-            tracing::error!(
-                err = %err,
-                filename = %filename,
-                "failed to upload data to S3"
-            );
-        }
-    }
-
-    let end = Instant::now();
-    tracing::debug!(
-        "Finished executing for task {} in time {:?}",
-        id,
-        end - start
-    );
     Ok(())
 }
 
